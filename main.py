@@ -9,11 +9,39 @@ import os
 import copy
 import datetime
 import random
-
+from eval_personalization import evaluate_personalization, evaluate_generalization_head_avg
 
 from model import *
 from utils import *
 
+def get_run_dir(args):
+    base = "/content/drive/MyDrive/fed_runs" if os.path.exists("/content/drive/MyDrive") else "./fed_runs"
+    os.makedirs(base, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    exp_name = f"{args.alg}_{args.dataset}_P{args.n_parties}_R{args.comm_round}_{stamp}"
+    run_dir = os.path.join(base, exp_name)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def save_experiment(run_dir, args, global_model, g_acc, p_acc):
+    # 모델 저장
+    torch.save(global_model.state_dict(),
+               os.path.join(run_dir, "global_model_final.pth"))
+
+    # args 저장
+    with open(os.path.join(run_dir, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    # 결과 저장
+    results = {
+        "generalization_acc": float(g_acc),
+        "personalization_acc": float(p_acc)
+    }
+
+    with open(os.path.join(run_dir, "metrics.json"), "w") as f:
+        json.dump(results, f, indent=2)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -53,10 +81,26 @@ def get_args():
     parser.add_argument('--normal_model', type=int, default=0, help='use normal model or aggregate model')
     parser.add_argument('--loss', type=str, default='contrastive')
     parser.add_argument('--save_model',type=int,default=0)
-    parser.add_argument('--use_project_head', type=int, default=1)
+    parser.add_argument('--use_project_head', type=int, default=1) # 안 쓸 때 0으로 세팅
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
+    # ----- FedBABU / FedCAP evaluation hyperparameters -----
+    parser.add_argument('--Kg', type=int, default=50,
+                        help='number of head fine-tuning steps for generalization evaluation')
+
+    parser.add_argument('--Kp', type=int, default=50,
+                        help='number of head fine-tuning steps for personalization evaluation')
+
+    parser.add_argument('--head_lr', type=float, default=0.01,
+                        help='learning rate for head fine-tuning')
+
+    parser.add_argument('--eval_every', type=int, default=0,
+                        help='evaluate personalization every N rounds (0 = only final round)')
     args = parser.parse_args()
-    return args
+    
+    run_dir = get_run_dir(args)
+    print("Saving to:", run_dir)
+    
+    return args, run_dir
 
 
 def init_nets(net_configs, n_parties, args, device='cpu'):
@@ -373,6 +417,10 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         elif args.alg == 'local_training':
             trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
                                           device=device)
+        #fedbabu
+        elif args.alg == 'fedbabu':
+            trainacc, testacc = train_net_fedbabu(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, device=device)
+
         logger.info("net %d final test acc %f" % (net_id, testacc))
         avg_acc += testacc
         acc_list.append(testacc)
@@ -388,9 +436,56 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         server_c.to('cpu')
     return nets
 
+# fedbabu 학습
+def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu"):
+    net = nn.DataParallel(net)
+    net.cuda()
+    logger.info('Training network %s (FedBABU)' % str(net_id))
+    logger.info('n_training: %d' % len(train_dataloader))
+    logger.info('n_test: %d' % len(test_dataloader))
+
+    # 1) head(l3) freeze (ModelFedCon 기준)
+    if hasattr(net.module, "l3"):
+        for p in net.module.l3.parameters():
+            p.requires_grad = False
+    else:
+        logger.warning("FedBABU: net has no attribute l3. (Check model definition)")
+
+    # 2) optimizer: requires_grad=True만 학습 (head 자동 제외)
+    if args_optimizer == 'adam':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
+    elif args_optimizer == 'amsgrad':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
+    elif args_optimizer == 'sgd':
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
+
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for batch_idx, (x, target) in enumerate(train_dataloader):
+            x, target = x.cuda(), target.cuda()
+            optimizer.zero_grad()
+
+            target = target.long()
+            _, _, out = net(x)          # logits만
+            loss = criterion(out, target)
+
+            loss.backward()
+            optimizer.step()
+            epoch_loss_collector.append(loss.item())
+
+        logger.info('Epoch: %d Loss: %f' % (epoch, sum(epoch_loss_collector)/len(epoch_loss_collector)))
+
+    logger.info(' ** FedBABU Training complete **')
+    train_acc, _ = compute_accuracy(net, train_dataloader, device="cuda")
+    test_acc, _, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device="cuda")
+    net.to("cpu")
+    return train_acc, test_acc
+
 
 if __name__ == '__main__':
-    args = get_args()
+    args, run_dir = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
     if args.log_file_name is None:
@@ -454,6 +549,40 @@ if __name__ == '__main__':
     global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cpu')
     global_model = global_models[0]
     n_comm_rounds = args.comm_round
+    # ===== after global_model is defined =====
+    def is_head_key(k: str) -> bool:
+        return k.startswith("l3.") or k.startswith("module.l3.")
+
+    def extract_head_sd(model):
+        sd = model.state_dict()
+        return {k: v.detach().clone() for k, v in sd.items() if is_head_key(k)}
+
+    def load_head_sd(model, head_sd):
+        sd = model.state_dict()
+        for k, v in head_sd.items():
+            sd[k] = v
+        model.load_state_dict(sd)
+
+    def broadcast_fixed_head(nets, global_model, fixed_head_sd):
+        load_head_sd(global_model, fixed_head_sd)
+        for cid in nets.keys():
+            load_head_sd(nets[cid], fixed_head_sd)
+
+    # ---- create fixed shared head once ----
+    fixed_head_sd = None
+    if args.alg in ["fedbabu", "fedcap"]:
+        fixed_head_sd = extract_head_sd(global_model)  # <- global head를 기준으로
+        broadcast_fixed_head(nets, global_model, fixed_head_sd)
+        logger.info("FedBABU/FedCAP: FIXED shared random head is broadcast to all clients.")
+
+    def load_body_only(net, global_w):
+        local_w = net.state_dict()
+        for k in global_w:
+            if k.startswith("l3.") or k.startswith("module.l3."):
+                continue
+            local_w[k] = global_w[k]
+        net.load_state_dict(local_w)
+
     if args.load_model_file and args.alg != 'plot_visual':
         global_model.load_state_dict(torch.load(args.load_model_file))
         n_comm_rounds -= args.load_model_round
@@ -670,4 +799,84 @@ if __name__ == '__main__':
         mkdirs(args.modeldir + 'all_in/')
 
         torch.save(nets[0].state_dict(), args.modeldir+'all_in/'+args.log_file_name+ '.pth')
+    # fedbabu
+    elif args.alg == 'fedbabu':
 
+        for round in range(n_comm_rounds):
+            logger.info("in comm round:" + str(round))
+            party_list_this_round = party_list_rounds[round]
+
+            global_w = global_model.state_dict()
+
+            nets_this_round = {k: nets[k] for k in party_list_this_round}
+            for net in nets_this_round.values():
+                load_body_only(net, global_w)
+
+            local_train_net(nets_this_round, args, net_dataidx_map,
+                            train_dl=train_dl, test_dl=test_dl, device=device)
+
+            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+
+            for net_id, net in enumerate(nets_this_round.values()):
+                net_para = net.state_dict()
+
+                if net_id == 0:
+                    for key in net_para:
+                        if key.startswith("l3.") or key.startswith("module.l3."):
+                            continue
+                        global_w[key] = net_para[key] * fed_avg_freqs[net_id]
+                else:
+                    for key in net_para:
+                        if key.startswith("l3.") or key.startswith("module.l3."):
+                            continue
+                        global_w[key] += net_para[key] * fed_avg_freqs[net_id]
+
+            global_model.load_state_dict(global_w)
+
+            global_model.cuda()
+            train_acc, train_loss = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix, _ = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
+            global_model.to('cpu')
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
+    # ---- evaluation ----
+    eval_clients = list(nets.keys())
+
+    g_acc = evaluate_generalization_head_avg(
+        global_model=global_model,
+        client_list=eval_clients,
+        nets=nets,
+        net_dataidx_map=net_dataidx_map,
+        get_dataloader_fn=get_dataloader,
+        compute_accuracy_fn=compute_accuracy,
+        test_dl=test_dl,
+        args=args,
+        Kg=args.Kg,
+        head_lr=args.head_lr,
+        device=device
+    )
+    logger.info(">> Generalization acc (head-avg): %f" % g_acc)
+
+    p_acc_mean, _ = evaluate_personalization(
+        global_model=global_model,
+        client_list=eval_clients,
+        nets=nets,
+        net_dataidx_map=net_dataidx_map,
+        get_dataloader_fn=get_dataloader,
+        compute_accuracy_fn=compute_accuracy,
+        test_dl=test_dl,
+        args=args,
+        Kp=args.Kp,
+        head_lr=args.head_lr,
+        device=device
+    )
+    save_experiment(run_dir, args, global_model, g_acc, p_acc_mean)
+    print("Experiment saved.")
+
+    logger.info(">> Personalization acc (mean): %f" % p_acc_mean)
+
+    logger.info("[FINAL] alg=%s Kg=%d Kp=%d GenAcc=%.4f PersAcc=%.4f" %
+                (args.alg, args.Kg, args.Kp, g_acc, p_acc_mean))
