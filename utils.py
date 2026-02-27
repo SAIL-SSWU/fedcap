@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 import random
 from sklearn.metrics import confusion_matrix
+import torch.utils.data as data
+
 
 from model import *
 from datasets import CIFAR10_truncated, CIFAR100_truncated, ImageFolder_custom
@@ -88,7 +90,8 @@ def record_net_data_stats(y_train, net_dataidx_map, logdir):
     return net_cls_counts
 
 
-def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
+def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4,
+                   holdout_ratio=0.2, seed=0):
     if dataset == 'cifar10':
         X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
     elif dataset == 'cifar100':
@@ -98,11 +101,15 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
 
     n_train = y_train.shape[0]
 
-    if partition == "homo" or partition == "iid":
-        idxs = np.random.permutation(n_train)
-        batch_idxs = np.array_split(idxs, n_parties)
-        net_dataidx_map = {i: batch_idxs[i] for i in range(n_parties)}
+    rng = np.random.RandomState(seed)
 
+    # -------------------------
+    # 1) 기존처럼 train partition 생성
+    # -------------------------
+    if partition == "homo" or partition == "iid":
+        idxs = rng.permutation(n_train)
+        batch_idxs = np.array_split(idxs, n_parties)
+        net_dataidx_map = {i: batch_idxs[i].tolist() for i in range(n_parties)}
 
     elif partition == "noniid-labeldir" or partition == "noniid":
         min_size = 0
@@ -112,7 +119,6 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
             K = 100
         elif dataset == 'tinyimagenet':
             K = 200
-            # min_require_size = 100
 
         N = y_train.shape[0]
         net_dataidx_map = {}
@@ -121,24 +127,48 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
             idx_batch = [[] for _ in range(n_parties)]
             for k in range(K):
                 idx_k = np.where(y_train == k)[0]
-                np.random.shuffle(idx_k)
-                proportions = np.random.dirichlet(np.repeat(beta, n_parties))
-                proportions = np.array([p * (len(idx_j) < N / n_parties) for p, idx_j in zip(proportions, idx_batch)])
+                rng.shuffle(idx_k)
+
+                proportions = rng.dirichlet(np.repeat(beta, n_parties))
+                proportions = np.array([p * (len(idx_j) < N / n_parties)
+                                        for p, idx_j in zip(proportions, idx_batch)])
                 proportions = proportions / proportions.sum()
-                proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-                idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
-                min_size = min([len(idx_j) for idx_j in idx_batch])
-                # if K == 2 and n_parties <= 10:
-                #     if np.min(proportions) < 200:
-                #         min_size = 0
-                #         break
+                cut = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+
+                splits = np.split(idx_k, cut)
+                idx_batch = [idx_j + split.tolist() for idx_j, split in zip(idx_batch, splits)]
+
+            min_size = min(len(idx_j) for idx_j in idx_batch)
 
         for j in range(n_parties):
-            np.random.shuffle(idx_batch[j])
+            rng.shuffle(idx_batch[j])
             net_dataidx_map[j] = idx_batch[j]
 
-    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map, logdir)
-    return (X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts)
+    # -------------------------
+    # 2) client별 holdout split 생성 (train/local-test)
+    # -------------------------
+    net_dataidx_map_train = {}
+    net_dataidx_map_test = {}
+    for cid, idxs in net_dataidx_map.items():
+        idxs = np.array(idxs)
+        rng.shuffle(idxs)
+
+        n_holdout = int(len(idxs) * holdout_ratio)
+        # 너무 작아서 0 되면 최소 1은 떼도록(원하면 조정)
+        if n_holdout == 0 and len(idxs) >= 2:
+            n_holdout = 1
+
+        test_idxs = idxs[:n_holdout].tolist()
+        train_idxs = idxs[n_holdout:].tolist()
+
+        net_dataidx_map_train[cid] = train_idxs
+        net_dataidx_map_test[cid] = test_idxs
+
+    # 로깅은 "학습에 쓰는 train split" 기준이 더 자연스러움
+    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map_train, logdir)
+
+    return (X_train, y_train, X_test, y_test,
+            net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts)
 
 
 def get_trainable_parameters(net, device='cpu'):
@@ -291,79 +321,100 @@ def load_model(model, model_index, device="cpu"):
     return model
 
 
-def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_level=0):
-    if dataset in ('cifar10', 'cifar100'):
-        if dataset == 'cifar10':
+def get_dataloader(
+    dataset,
+    datadir,
+    train_bs,
+    test_bs,
+    dataidxs=None,          # client train indices
+    test_dataidxs=None,     # client test indices (optional)
+    noise_level=0
+):
+    
+    if dataset in ("cifar10", "cifar100"):
+        if dataset == "cifar10":
             dl_obj = CIFAR10_truncated
-
-            normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-                                             std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
+            normalize = transforms.Normalize(
+                mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
+                std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
+            )
             transform_train = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: F.pad(
                     Variable(x.unsqueeze(0), requires_grad=False),
-                    (4, 4, 4, 4), mode='reflect').data.squeeze()),
+                    (4, 4, 4, 4), mode="reflect"
+                ).data.squeeze()),
                 transforms.ToPILImage(),
                 transforms.ColorJitter(brightness=noise_level),
                 transforms.RandomCrop(32),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize
+                normalize,
             ])
-            # data prep for test set
             transform_test = transforms.Compose([
                 transforms.ToTensor(),
-                normalize])
+                normalize,
+            ])
 
-        elif dataset == 'cifar100':
+        else:  # cifar100
             dl_obj = CIFAR100_truncated
-
-            normalize = transforms.Normalize(mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
-                                             std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
-            # transform_train = transforms.Compose([
-            #     transforms.RandomCrop(32),
-            #     transforms.RandomHorizontalFlip(),
-            #     transforms.ToTensor(),
-            #     normalize
-            # ])
+            normalize = transforms.Normalize(
+                mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
+                std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404],
+            )
             transform_train = transforms.Compose([
-                # transforms.ToPILImage(),
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(15),
                 transforms.ToTensor(),
-                normalize
+                normalize,
             ])
-            # data prep for test set
             transform_test = transforms.Compose([
                 transforms.ToTensor(),
-                normalize])
+                normalize,
+            ])
 
+        # ---- train subset (client train) ----
+        train_ds = dl_obj(
+            datadir,
+            dataidxs=dataidxs,
+            train=True,
+            transform=transform_train,
+            download=True,
+        )
 
+        # ---- test set ----
+        # 1) if client-specific test indices are provided: build subset from training split (train=True)
+        # 2) else: use standard global test split (train=False)
+        if test_dataidxs is not None:
+            test_ds = dl_obj(
+                datadir,
+                dataidxs=test_dataidxs,
+                train=True,                # IMPORTANT: because indices refer to training split
+                transform=transform_test,
+                download=True,
+            )
+        else:
+            test_ds = dl_obj(
+                datadir,
+                train=False,
+                transform=transform_test,
+                download=True,
+            )
 
-        train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
-        test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+        train_dl = data.DataLoader(
+            dataset=train_ds,
+            batch_size=train_bs,
+            drop_last=True,
+            shuffle=True,
+        )
+        test_dl = data.DataLoader(
+            dataset=test_ds,
+            batch_size=test_bs,
+            shuffle=False,
+        )
 
-        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
-        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
+        return train_dl, test_dl, train_ds, test_ds
 
-
-    elif dataset == 'tinyimagenet':
-        dl_obj = ImageFolder_custom
-        transform_train = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ])
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ])
-
-        train_ds = dl_obj(datadir+'./train/', dataidxs=dataidxs, transform=transform_train)
-        test_ds = dl_obj(datadir+'./val/', transform=transform_test)
-
-        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
-        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
-
-
-    return train_dl, test_dl, train_ds, test_ds
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")

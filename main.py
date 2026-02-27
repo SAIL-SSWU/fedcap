@@ -7,7 +7,7 @@ import argparse
 import logging
 import os
 import copy
-import datetime
+from datetime import datetime
 import random
 from eval_personalization import evaluate_personalization, evaluate_generalization_head_avg
 
@@ -478,8 +478,8 @@ def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr
         logger.info('Epoch: %d Loss: %f' % (epoch, sum(epoch_loss_collector)/len(epoch_loss_collector)))
 
     logger.info(' ** FedBABU Training complete **')
-    train_acc, _ = compute_accuracy(net, train_dataloader, device="cuda")
-    test_acc, _, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device="cuda")
+    train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, _, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
     net.to("cpu")
     return train_acc, test_acc
 
@@ -489,7 +489,7 @@ if __name__ == '__main__':
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
     if args.log_file_name is None:
-        argument_path = 'experiment_arguments-%s.json' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
+        argument_path = 'experiment_arguments-%s.json' % datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     else:
         argument_path = args.log_file_name + '.json'
     with open(os.path.join(args.logdir, argument_path), 'w') as f:
@@ -499,7 +499,7 @@ if __name__ == '__main__':
         logging.root.removeHandler(handler)
 
     if args.log_file_name is None:
-        args.log_file_name = 'experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
+        args.log_file_name = 'experiment_log-%s' % (datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
     log_path = args.log_file_name + '.log'
     logging.basicConfig(
         filename=os.path.join(args.logdir, log_path),
@@ -519,8 +519,9 @@ if __name__ == '__main__':
     random.seed(seed)
 
     logger.info("Partitioning data")
-    X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
-        args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
+    X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts = partition_data(
+    args.dataset, args.datadir, args.logdir, args.partition, args.n_parties,
+    beta=args.beta, holdout_ratio=0.2, seed=args.init_seed)
 
     n_party_per_round = int(args.n_parties * args.sample_fraction)
     party_list = [i for i in range(args.n_parties)]
@@ -625,12 +626,12 @@ if __name__ == '__main__':
                 net.load_state_dict(global_w)
 
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
+            local_train_net(nets_this_round, args, net_dataidx_map_train, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
 
 
 
-            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            total_data_points = sum([len(net_dataidx_map_train[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in party_list_this_round]
 
 
             for net_id, net in enumerate(nets_this_round.values()):
@@ -701,10 +702,10 @@ if __name__ == '__main__':
             for net in nets_this_round.values():
                 net.load_state_dict(global_w)
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, device=device)
+            local_train_net(nets_this_round, args, net_dataidx_map_train, train_dl=train_dl, test_dl=test_dl, device=device)
 
-            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            total_data_points = sum([len(net_dataidx_map_train[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in party_list_this_round]
 
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
@@ -751,12 +752,12 @@ if __name__ == '__main__':
                 net.load_state_dict(global_w)
 
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl,test_dl=test_dl, global_model = global_model, device=device)
+            local_train_net(nets_this_round, args, net_dataidx_map_train, train_dl=train_dl,test_dl=test_dl, global_model = global_model, device=device)
             global_model.to('cpu')
 
             # update global model
-            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            total_data_points = sum([len(net_dataidx_map_train[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in party_list_this_round]
 
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
@@ -785,7 +786,7 @@ if __name__ == '__main__':
 
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
-        local_train_net(nets, args, net_dataidx_map, train_dl=train_dl,test_dl=test_dl, device=device)
+        local_train_net(nets, args, net_dataidx_map_train, train_dl=train_dl,test_dl=test_dl, device=device)
         mkdirs(args.modeldir + 'localmodel/')
         for net_id, net in nets.items():
             torch.save(net.state_dict(), args.modeldir + 'localmodel/'+'model'+str(net_id)+args.log_file_name+ '.pth')
@@ -812,11 +813,11 @@ if __name__ == '__main__':
             for net in nets_this_round.values():
                 load_body_only(net, global_w)
 
-            local_train_net(nets_this_round, args, net_dataidx_map,
+            local_train_net(nets_this_round, args, net_dataidx_map_train,
                             train_dl=train_dl, test_dl=test_dl, device=device)
 
-            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            total_data_points = sum([len(net_dataidx_map_train[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in party_list_this_round]
 
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
@@ -849,7 +850,7 @@ if __name__ == '__main__':
         global_model=global_model,
         client_list=eval_clients,
         nets=nets,
-        net_dataidx_map=net_dataidx_map,
+        net_dataidx_map=net_dataidx_map_train,
         get_dataloader_fn=get_dataloader,
         compute_accuracy_fn=compute_accuracy,
         test_dl=test_dl,
@@ -864,7 +865,8 @@ if __name__ == '__main__':
         global_model=global_model,
         client_list=eval_clients,
         nets=nets,
-        net_dataidx_map=net_dataidx_map,
+        net_dataidx_map_train=net_dataidx_map_train,
+        net_dataidx_map_test=net_dataidx_map_test,
         get_dataloader_fn=get_dataloader,
         compute_accuracy_fn=compute_accuracy,
         test_dl=test_dl,
