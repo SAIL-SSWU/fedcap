@@ -10,6 +10,7 @@ import torch.nn as nn
 import random
 from sklearn.metrics import confusion_matrix
 import torch.utils.data as data
+from collections import defaultdict, deque
 
 
 from model import *
@@ -321,100 +322,96 @@ def load_model(model, model_index, device="cpu"):
     return model
 
 
-def get_dataloader(
-    dataset,
-    datadir,
-    train_bs,
-    test_bs,
-    dataidxs=None,          # client train indices
-    test_dataidxs=None,     # client test indices (optional)
-    noise_level=0
-):
-    
-    if dataset in ("cifar10", "cifar100"):
-        if dataset == "cifar10":
+def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, test_dataidxs=None, noise_level=0):
+    if dataset in ('cifar10', 'cifar100'):
+        if dataset == 'cifar10':
             dl_obj = CIFAR10_truncated
             normalize = transforms.Normalize(
                 mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-                std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
+                std=[x / 255.0 for x in [63.0, 62.1, 66.7]]
             )
             transform_train = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: F.pad(
                     Variable(x.unsqueeze(0), requires_grad=False),
-                    (4, 4, 4, 4), mode="reflect"
-                ).data.squeeze()),
+                    (4, 4, 4, 4), mode='reflect').data.squeeze()),
                 transforms.ToPILImage(),
                 transforms.ColorJitter(brightness=noise_level),
                 transforms.RandomCrop(32),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
+                normalize
             ])
-            transform_test = transforms.Compose([
-                transforms.ToTensor(),
-                normalize,
-            ])
+            transform_test = transforms.Compose([transforms.ToTensor(), normalize])
 
-        else:  # cifar100
+        elif dataset == 'cifar100':
             dl_obj = CIFAR100_truncated
             normalize = transforms.Normalize(
                 mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
-                std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404],
+                std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
             )
             transform_train = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(15),
                 transforms.ToTensor(),
-                normalize,
+                normalize
             ])
-            transform_test = transforms.Compose([
-                transforms.ToTensor(),
-                normalize,
-            ])
+            transform_test = transforms.Compose([transforms.ToTensor(), normalize])
 
-        # ---- train subset (client train) ----
-        train_ds = dl_obj(
-            datadir,
-            dataidxs=dataidxs,
-            train=True,
-            transform=transform_train,
-            download=True,
-        )
+        # ---- train split (client train) ----
+        train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
 
-        # ---- test set ----
-        # 1) if client-specific test indices are provided: build subset from training split (train=True)
-        # 2) else: use standard global test split (train=False)
+        # ---- test split ----
+        # 1) client-local test (from TRAIN set indices)
         if test_dataidxs is not None:
-            test_ds = dl_obj(
-                datadir,
-                dataidxs=test_dataidxs,
-                train=True,                # IMPORTANT: because indices refer to training split
-                transform=transform_test,
-                download=True,
-            )
+            test_ds = dl_obj(datadir, dataidxs=test_dataidxs, train=True, transform=transform_test, download=True)
+        # 2) global test (official test set)
         else:
-            test_ds = dl_obj(
-                datadir,
-                train=False,
-                transform=transform_test,
-                download=True,
-            )
+            test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
 
-        train_dl = data.DataLoader(
-            dataset=train_ds,
-            batch_size=train_bs,
-            drop_last=True,
-            shuffle=True,
-        )
-        test_dl = data.DataLoader(
-            dataset=test_ds,
-            batch_size=test_bs,
-            shuffle=False,
-        )
-
+        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
+        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
         return train_dl, test_dl, train_ds, test_ds
 
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
+    
+def extract_body_proj_state(net):
+    sd = net.state_dict()
+    return {k: v.detach().cpu().clone() for k, v in sd.items() if not k.startswith("l3.")}
+
+def load_body_proj_only(net, global_net):
+    gsd = global_net.state_dict()
+    nsd = net.state_dict()
+    for k, v in gsd.items():
+        if k.startswith("l3."):
+            continue
+        nsd[k].copy_(v)
+    net.load_state_dict(nsd, strict=False)
+
+def load_body_proj_state(net, bodyproj_sd):
+    nsd = net.state_dict()
+    for k, v in bodyproj_sd.items():
+        nsd[k].copy_(v.to(nsd[k].device))
+    net.load_state_dict(nsd, strict=False)
+
+def aggregate_body_proj_only(global_net, nets, selected, weights):
+    # weights: selected client별 sample 비중 (없으면 균등)
+    gsd = global_net.state_dict()
+
+    # init accum
+    acc = {k: torch.zeros_like(v) for k, v in gsd.items() if not k.startswith("l3.")}
+
+    # accumulate
+    for cid in selected:
+        sd = nets[cid].state_dict()
+        w = weights[cid] if isinstance(weights, dict) else 1.0 / len(selected)
+        for k in acc.keys():
+            acc[k] += sd[k] * w
+
+    # write back
+    for k in acc.keys():
+        gsd[k] = acc[k]
+    global_net.load_state_dict(gsd, strict=False)
+    return global_net

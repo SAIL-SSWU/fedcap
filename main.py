@@ -10,6 +10,9 @@ import copy
 from datetime import datetime
 import random
 from eval_personalization import evaluate_personalization, evaluate_generalization_head_avg
+from collections import defaultdict, deque
+import copy
+import torch.nn.functional as F
 
 from model import *
 from utils import *
@@ -417,10 +420,15 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         elif args.alg == 'local_training':
             trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
                                           device=device)
-        #fedbabu
+        # fedbabu
         elif args.alg == 'fedbabu':
             trainacc, testacc = train_net_fedbabu(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, device=device)
-
+        # fedcap
+        elif args.alg == 'fedcap':
+            # prev_model_pool는 fedcap_hist (dict: cid -> deque[snapshots])로 전달됨
+            previous_snaps = list(prev_model_pool[net_id]) if prev_model_pool is not None else []
+            trainacc, testacc = train_net_fedcap(
+                net_id, net, global_model, previous_snaps,train_dl_local, test_dl, n_epoch, args.lr,args.optimizer, args.mu, args.temperature, args, round, device=device)
         logger.info("net %d final test acc %f" % (net_id, testacc))
         avg_acc += testacc
         acc_list.append(testacc)
@@ -483,6 +491,107 @@ def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr
     net.to("cpu")
     return train_acc, test_acc
 
+# fedcap 학습
+def train_net_fedcap(net_id, net, global_net, previous_snapshots,
+                     train_dataloader, test_dataloader,
+                     epochs, lr, args_optimizer, mu, temperature, args,
+                     round, device="cpu"):
+
+    net = nn.DataParallel(net)
+    net.cuda()
+
+    logger.info('Training network %s (FedCAP)' % str(net_id))
+    logger.info('n_training: %d' % len(train_dataloader))
+    logger.info('n_test: %d' % len(test_dataloader))
+
+    # --- FedBABU rule: freeze head (l3) ---
+    for name, p in net.named_parameters():
+        # DataParallel이면 name이 "module.l3.weight" 형태가 됨
+        if "l3." in name:
+            p.requires_grad = False
+
+    if args_optimizer == 'adam':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
+    elif args_optimizer == 'amsgrad':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
+    elif args_optimizer == 'sgd':
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
+
+    criterion = nn.CrossEntropyLoss().cuda()
+    cos = torch.nn.CosineSimilarity(dim=-1)
+
+    # global_net은 projection만 뽑는 용도
+    global_net.cuda()
+    global_net.eval()
+    for p in global_net.parameters():
+        p.requires_grad = False
+
+    # 임시 모델: history snapshot 로드해서 pro3 계산
+    # (global_net과 같은 구조의 모델을 복제)
+    tmp_net = copy.deepcopy(global_net)
+    tmp_net.cuda()
+    tmp_net.eval()
+    for p in tmp_net.parameters():
+        p.requires_grad = False
+
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        epoch_loss1_collector = []
+        epoch_loss2_collector = []
+
+        for batch_idx, (x, target) in enumerate(train_dataloader):
+            x, target = x.cuda(), target.cuda().long()
+
+            optimizer.zero_grad()
+
+            # local forward
+            _, pro1, out = net(x)           # pro1: local projection
+            # global projection (positive)
+            with torch.no_grad():
+                _, pro2, _ = global_net(x)  # pro2: global projection
+
+            posi = cos(pro1, pro2)
+            logits = posi.reshape(-1, 1)
+
+            # negatives: self-history snapshots
+            if previous_snapshots is not None and len(previous_snapshots) > 0:
+                for snap in previous_snapshots:
+                    load_body_proj_state(tmp_net, snap)   # <-- 여기서 load_body_proj_state 사용
+                    with torch.no_grad():
+                        _, pro3, _ = tmp_net(x)           # pro3: history projection
+                    nega = cos(pro1, pro3)
+                    logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
+
+                logits /= temperature
+                labels = torch.zeros(x.size(0)).cuda().long()  # positive가 0번 컬럼
+                loss2 = mu * criterion(logits, labels)
+            else:
+                # history가 없으면 contrastive 없음
+                loss2 = torch.tensor(0.0, device=x.device)
+
+            # supervised loss (head frozen이지만 gradient는 body+proj로 흐름)
+            loss1 = criterion(out, target)
+
+            loss = loss1 + loss2
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss_collector.append(loss.item())
+            epoch_loss1_collector.append(loss1.item())
+            epoch_loss2_collector.append(loss2.item())
+
+        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+        epoch_loss1 = sum(epoch_loss1_collector) / len(epoch_loss1_collector)
+        epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
+        logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
+    
+    logger.info(' ** FedCAP Training complete **')
+    train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, _, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    net.to("cpu")
+    global_net.to("cpu")
+    tmp_net.to("cpu")
+    return train_acc, test_acc
 
 if __name__ == '__main__':
     args, run_dir = get_args()
@@ -842,6 +951,83 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+    # fedcap
+    elif args.alg == 'fedcap':
+        fedcap_hist = defaultdict(lambda: deque(maxlen=args.model_buffer_size))
+
+        # (옵션) load_first_net이면 첫 라운드 history 초기화(비어있어도 상관없어서 없어도 됨)
+        # 보통은 비워두고 시작해도 OK
+
+        for round in range(n_comm_rounds):
+            logger.info("in comm round:" + str(round))
+            party_list_this_round = party_list_rounds[round]
+
+            global_model.eval()
+            for param in global_model.parameters():
+                param.requires_grad = False
+            global_w = global_model.state_dict()
+
+            if args.server_momentum:
+                old_w = copy.deepcopy(global_model.state_dict())
+
+            nets_this_round = {k: nets[k] for k in party_list_this_round}
+
+            # --- broadcast: body+proj만 (head 유지) ---
+            for net in nets_this_round.values():
+                load_body_proj_only(net, global_model)   # 모델을 넘김
+
+            # --- local update (FedCAP): prev_model_pool 자리에 fedcap_hist를 넘김 ---
+            local_train_net(
+                nets_this_round, args, net_dataidx_map,
+                train_dl=train_dl, test_dl=test_dl,
+                global_model=global_model,
+                prev_model_pool=fedcap_hist,      # <-- 여기서 fedcap_hist 사용
+                round=round,
+                device=device
+            )
+
+            # --- aggregation: body+proj만 평균 (l3 제외) ---
+            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+
+            for net_id, net in enumerate(nets_this_round.values()):
+                net_para = net.state_dict()
+                if net_id == 0:
+                    for key in net_para:
+                        if key.startswith("l3."):
+                            continue
+                        global_w[key] = net_para[key] * fed_avg_freqs[net_id]
+                else:
+                    for key in net_para:
+                        if key.startswith("l3."):
+                            continue
+                        global_w[key] += net_para[key] * fed_avg_freqs[net_id]
+
+            if args.server_momentum:
+                delta_w = copy.deepcopy(global_w)
+                for key in delta_w:
+                    if key.startswith("l3."):
+                        continue
+                    delta_w[key] = old_w[key] - global_w[key]
+                    moment_v[key] = args.server_momentum * moment_v[key] + (1-args.server_momentum) * delta_w[key]
+                    global_w[key] = old_w[key] - moment_v[key]
+
+            global_model.load_state_dict(global_w, strict=False)
+
+            # --- global eval (moon이랑 동일) ---
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl))
+            global_model.cuda()
+            train_acc, train_loss = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix, _ = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
+            global_model.to('cpu')
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            logger.info('>> Global Model Train loss: %f' % train_loss)
+
+            # --- history update: 참여한 cid만 snapshot 저장 (θ,ψ만) ---
+            for cid in party_list_this_round:
+                fedcap_hist[cid].append(extract_body_proj_state(nets[cid]))  # <-- 여기서 extract_body_proj_state 사용
 
     # ---- evaluation ----
     eval_clients = list(nets.keys())
