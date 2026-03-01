@@ -46,6 +46,30 @@ def save_experiment(run_dir, args, global_model, g_acc, p_acc):
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
 
+def save_ckpt(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+
+def load_ckpt(path, map_location="cpu"):
+    return torch.load(path, map_location=map_location)
+
+def capture_rng_state():
+    state = {
+        "py_random": random.getstate(),
+        "np_random": np.random.get_state(),
+        "torch_rng": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()
+    return state
+
+def restore_rng_state(state):
+    random.setstate(state["py_random"])
+    np.random.set_state(state["np_random"])
+    torch.random.set_rng_state(state["torch_rng"])
+    if torch.cuda.is_available() and "cuda_rng" in state:
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='resnet50', help='neural network used in training')
@@ -98,6 +122,9 @@ def get_args():
 
     parser.add_argument('--eval_every', type=int, default=0,
                         help='evaluate personalization every N rounds (0 = only final round)')
+    parser.add_argument('--resume_ckpt', type=str, default=None, help='path to checkpoint .pth')
+    parser.add_argument('--ckpt_every', type=int, default=5, help='save checkpoint every N rounds')
+    
     args = parser.parse_args()
     
     run_dir = get_run_dir(args)
@@ -129,7 +156,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
             if device == 'cpu':
                 net.to(device)
             else:
-                net = net.cuda()
+                net = net.to(device)
             nets[net_i] = net
     else:
         for net_i in range(n_parties):
@@ -140,7 +167,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
             if device == 'cpu':
                 net.to(device)
             else:
-                net = net.cuda()
+                net = net.to(device)
             nets[net_i] = net
 
     model_meta_data = []
@@ -151,10 +178,16 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
 
     return nets, model_meta_data, layer_type
 
+def to_device(model, device):
+    return model.to(device)
+
+def unwrap_dp(model):
+    return model.module if hasattr(model, "module") else model
 
 def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu"):
-    net = nn.DataParallel(net)
-    net.cuda()
+    # net = nn.DataParallel(net)
+    # net.cuda()
+    net = to_device(net, device)
     logger.info('Training network %s' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
@@ -174,14 +207,14 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
                               weight_decay=args.reg)
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     cnt = 0
 
     for epoch in range(epochs):
         epoch_loss_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
@@ -199,7 +232,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
-
+            
         if epoch % 10 == 0:
             train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
             test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
@@ -220,11 +253,11 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
 def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, args,
                       device="cpu"):
-    # global_net.to(device)
-    net = nn.DataParallel(net)
-    net.cuda()
+    global_net.to(device)
+    # net = nn.DataParallel(net)
+    # net.cuda()
     # else:
-    #     net.to(device)
+    net.to(device)
     logger.info('Training network %s' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
@@ -244,16 +277,16 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
                               weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     cnt = 0
-    global_weight_collector = list(global_net.cuda().parameters())
+    global_weight_collector = list(global_net.to(device).parameters())
 
 
     for epoch in range(epochs):
         epoch_loss_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
@@ -292,8 +325,9 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
 
 def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args,
                       round, device="cpu"):
-    net = nn.DataParallel(net)
-    net.cuda()
+    # net = nn.DataParallel(net)
+    # net.cuda()
+    net = to_device(net, device)
     logger.info('Training network %s' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
@@ -315,11 +349,11 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
                               weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
     # global_net.to(device)
 
     for previous_net in previous_nets:
-        previous_net.cuda()
+        previous_net.to(device)
     global_w = global_net.state_dict()
 
     cnt = 0
@@ -331,7 +365,7 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
         epoch_loss1_collector = []
         epoch_loss2_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
@@ -345,7 +379,7 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             logits = posi.reshape(-1,1)
 
             for previous_net in previous_nets:
-                previous_net.cuda()
+                previous_net.to(device)
                 _, pro3, _ = previous_net(x)
                 nega = cos(pro1, pro3)
                 logits = torch.cat((logits, nega.reshape(-1,1)), dim=1)
@@ -353,7 +387,7 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
                 previous_net.to('cpu')
 
             logits /= temperature
-            labels = torch.zeros(x.size(0)).cuda().long()
+            labels = torch.zeros(x.size(0), device=device).long()
 
             loss2 = mu * criterion(logits, labels)
 
@@ -391,10 +425,10 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
     avg_acc = 0.0
     acc_list = []
     if global_model:
-        global_model.cuda()
+        global_model.to(device)
     if server_c:
-        server_c.cuda()
-        server_c_collector = list(server_c.cuda().parameters())
+        server_c.to(device)
+        server_c_collector = list(server_c.to(device).parameters())
         new_server_c_collector = copy.deepcopy(server_c_collector)
     for net_id, net in nets.items():
         dataidxs = net_dataidx_map[net_id]
@@ -446,18 +480,20 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
 
 # fedbabu 학습
 def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu"):
-    net = nn.DataParallel(net)
-    net.cuda()
+    # net = nn.DataParallel(net)
+    # net.cuda()
+    net = to_device(net, device)
     logger.info('Training network %s (FedBABU)' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
 
     # 1) head(l3) freeze (ModelFedCon 기준)
-    if hasattr(net.module, "l3"):
-        for p in net.module.l3.parameters():
+    base = unwrap_dp(net)
+    if hasattr(base, "l3"):
+        for p in base.l3.parameters():
             p.requires_grad = False
-    else:
-        logger.warning("FedBABU: net has no attribute l3. (Check model definition)")
+        else:
+            logger.warning("FedBABU: net has no attribute l3. (Check model definition)")
 
     # 2) optimizer: requires_grad=True만 학습 (head 자동 제외)
     if args_optimizer == 'adam':
@@ -467,12 +503,12 @@ def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     for epoch in range(epochs):
         epoch_loss_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
             optimizer.zero_grad()
 
             target = target.long()
@@ -484,7 +520,6 @@ def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr
             epoch_loss_collector.append(loss.item())
 
         logger.info('Epoch: %d Loss: %f' % (epoch, sum(epoch_loss_collector)/len(epoch_loss_collector)))
-
     logger.info(' ** FedBABU Training complete **')
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, _, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
@@ -497,8 +532,9 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
                      epochs, lr, args_optimizer, mu, temperature, args,
                      round, device="cpu"):
 
-    net = nn.DataParallel(net)
-    net.cuda()
+    # net = nn.DataParallel(net)
+    # net.cuda()
+    net = to_device(net, device)
 
     logger.info('Training network %s (FedCAP)' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
@@ -517,11 +553,11 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
     cos = torch.nn.CosineSimilarity(dim=-1)
 
     # global_net은 projection만 뽑는 용도
-    global_net.cuda()
+    global_net.to(device)
     global_net.eval()
     for p in global_net.parameters():
         p.requires_grad = False
@@ -529,7 +565,7 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
     # 임시 모델: history snapshot 로드해서 pro3 계산
     # (global_net과 같은 구조의 모델을 복제)
     tmp_net = copy.deepcopy(global_net)
-    tmp_net.cuda()
+    tmp_net.to(device)
     tmp_net.eval()
     for p in tmp_net.parameters():
         p.requires_grad = False
@@ -540,7 +576,7 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
         epoch_loss2_collector = []
 
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda().long()
+            x, target = x.to(device), target.to(device).long()
 
             optimizer.zero_grad()
 
@@ -563,7 +599,7 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
                     logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
 
                 logits /= temperature
-                labels = torch.zeros(x.size(0)).cuda().long()  # positive가 0번 컬럼
+                labels = torch.zeros(x.size(0), device=device).long()  # positive가 0번 컬럼
                 loss2 = mu * criterion(logits, labels)
             else:
                 # history가 없으면 contrastive 없음
@@ -642,6 +678,7 @@ if __name__ == '__main__':
         for i in range(args.comm_round):
             party_list_rounds.append(party_list)
 
+
     n_classes = len(np.unique(y_train))
 
     train_dl_global, test_dl, train_ds_global, test_ds_global = get_dataloader(args.dataset,
@@ -658,7 +695,35 @@ if __name__ == '__main__':
 
     global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cpu')
     global_model = global_models[0]
+    
     n_comm_rounds = args.comm_round
+
+    start_round = 0
+    old_nets_pool = None
+    fedcap_hist = None
+
+    if args.resume_ckpt is not None:
+        ckpt = load_ckpt(args.resume_ckpt, map_location="cpu")
+        start_round = ckpt["round"]
+
+        # 복구: 참가자 목록
+        party_list_rounds = ckpt["party_list_rounds"]
+
+        # 복구: global model
+        global_model.load_state_dict(ckpt["global_model"])
+
+        # 복구: 이전 모델(moon, fedcap)
+        old_nets_pool = ckpt.get("old_nets_pool", None)
+        fedcap_hist = ckpt.get("fedcap_hist", None)
+
+        # RNG 복구
+        restore_rng_state(ckpt["rng_state"])
+
+        # data map 복구
+        if "net_dataidx_map_train" in ckpt:
+            net_dataidx_map_train = ckpt["net_dataidx_map_train"]
+            net_dataidx_map_test = ckpt["net_dataidx_map_test"]
+
     # ===== after global_model is defined =====
     def is_head_key(k: str) -> bool:
         return k.startswith("l3.") or k.startswith("module.l3.")
@@ -677,6 +742,20 @@ if __name__ == '__main__':
         load_head_sd(global_model, fixed_head_sd)
         for cid in nets.keys():
             load_head_sd(nets[cid], fixed_head_sd)
+            
+    def serialize_fedcap_hist(fedcap_hist):
+        if fedcap_hist is None:
+            return None
+        return {cid: list(deq) for cid, deq in fedcap_hist.items()}
+
+    def deserialize_fedcap_hist(obj, maxlen):
+        if obj is None:
+            return None
+        dd = defaultdict(lambda: deque(maxlen=maxlen))
+        for cid, snaps in obj.items():
+            dd[int(cid)] = deque(snaps, maxlen=maxlen)
+        return dd
+        
 
     # ---- create fixed shared head once ----
     fixed_head_sd = None
@@ -693,7 +772,7 @@ if __name__ == '__main__':
             local_w[k] = global_w[k]
         net.load_state_dict(local_w)
 
-    if args.load_model_file and args.alg != 'plot_visual':
+    if args.resume_ckpt is None and args.load_model_file and args.alg != 'plot_visual':
         global_model.load_state_dict(torch.load(args.load_model_file))
         n_comm_rounds -= args.load_model_round
 
@@ -701,8 +780,10 @@ if __name__ == '__main__':
         moment_v = copy.deepcopy(global_model.state_dict())
         for key in moment_v:
             moment_v[key] = 0
+
     if args.alg == 'moon':
-        old_nets_pool = []
+        if old_nets_pool is None:
+            old_nets_pool = []
         if args.load_pool_file:
             for nets_id in range(args.model_buffer_size):
                 old_nets, _, _ = init_nets(args.net_config, args.n_parties, args, device='cpu')
@@ -717,8 +798,8 @@ if __name__ == '__main__':
                     net.eval()
                     for param in net.parameters():
                         param.requires_grad = False
-
-        for round in range(n_comm_rounds):
+                old_nets_pool.append(old_nets)
+        for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -764,7 +845,7 @@ if __name__ == '__main__':
 
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl))
-            global_model.cuda()
+            global_model.to(device)
             train_acc, train_loss = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix, _ = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
             global_model.to('cpu')
@@ -796,10 +877,22 @@ if __name__ == '__main__':
                 torch.save(nets[0].state_dict(), args.modeldir+'fedcon/localmodel0'+args.log_file_name+'.pth')
                 for nets_id, old_nets in enumerate(old_nets_pool):
                     torch.save({'pool'+ str(nets_id) + '_'+'net'+str(net_id): net.state_dict() for net_id, net in old_nets.items()}, args.modeldir+'fedcon/prev_model_pool_'+args.log_file_name+'.pth')
-
-
+            
+            if (round + 1) % args.ckpt_every == 0:
+                ckpt_payload = {
+                    "round": round + 1,  # 다음 시작 라운드
+                    "global_model": global_model.state_dict(),
+                    "party_list_rounds": party_list_rounds,
+                    "rng_state": capture_rng_state(),
+                    "old_nets_pool": old_nets_pool,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "net_dataidx_map_test": net_dataidx_map_test,
+                }
+                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
+                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+        
     elif args.alg == 'fedavg':
-        for round in range(n_comm_rounds):
+        for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -850,9 +943,23 @@ if __name__ == '__main__':
 
             torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
+
+            if (round + 1) % args.ckpt_every == 0:
+                ckpt_payload = {
+                    "round": round + 1,  # 다음 시작 라운드
+                    "global_model": global_model.state_dict(),
+                    "party_list_rounds": party_list_rounds,
+                    "rng_state": capture_rng_state(),
+                    "old_nets_pool": old_nets_pool,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "net_dataidx_map_test": net_dataidx_map_test,
+                }
+                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
+                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+    
     elif args.alg == 'fedprox':
 
-        for round in range(n_comm_rounds):
+        for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
             global_w = global_model.state_dict()
@@ -893,6 +1000,20 @@ if __name__ == '__main__':
             global_model.to('cpu')
             torch.save(global_model.state_dict(), args.modeldir +'fedprox/'+args.log_file_name+ '.pth')
 
+            if (round + 1) % args.ckpt_every == 0:
+                ckpt_payload = {
+                    "round": round + 1,  # 다음 시작 라운드
+                    "global_model": global_model.state_dict(),
+                    "party_list_rounds": party_list_rounds,
+                    "rng_state": capture_rng_state(),
+                    "old_nets_pool": old_nets_pool,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
+                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "net_dataidx_map_test": net_dataidx_map_test,
+                }
+                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
+                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
         local_train_net(nets, args, net_dataidx_map_train, train_dl=train_dl,test_dl=test_dl, device=device)
@@ -912,7 +1033,7 @@ if __name__ == '__main__':
     # fedbabu
     elif args.alg == 'fedbabu':
 
-        for round in range(n_comm_rounds):
+        for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -951,14 +1072,33 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
+            if (round + 1) % args.ckpt_every == 0:
+                ckpt_payload = {
+                    "round": round + 1,  # 다음 시작 라운드
+                    "global_model": global_model.state_dict(),
+                    "party_list_rounds": party_list_rounds,
+                    "rng_state": capture_rng_state(),
+                    "old_nets_pool": old_nets_pool,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
+                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "net_dataidx_map_test": net_dataidx_map_test,
+                }
+                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
+                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
     # fedcap
     elif args.alg == 'fedcap':
-        fedcap_hist = defaultdict(lambda: deque(maxlen=args.model_buffer_size))
-
+        if fedcap_hist is None:
+            fedcap_hist = defaultdict(lambda: deque(maxlen=args.model_buffer_size))
+        else:
+            # 혹시 plain dict로 들어왔으면 defaultdict로 복구
+            if not isinstance(fedcap_hist, defaultdict):
+                fedcap_hist = deserialize_fedcap_hist(fedcap_hist, args.model_buffer_size)
+        
         # (옵션) load_first_net이면 첫 라운드 history 초기화(비어있어도 상관없어서 없어도 됨)
         # 보통은 비워두고 시작해도 OK
 
-        for round in range(n_comm_rounds):
+        for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -978,7 +1118,7 @@ if __name__ == '__main__':
 
             # --- local update (FedCAP): prev_model_pool 자리에 fedcap_hist를 넘김 ---
             local_train_net(
-                nets_this_round, args, net_dataidx_map,
+                nets_this_round, args, net_dataidx_map_train,
                 train_dl=train_dl, test_dl=test_dl,
                 global_model=global_model,
                 prev_model_pool=fedcap_hist,      # <-- 여기서 fedcap_hist 사용
@@ -987,8 +1127,8 @@ if __name__ == '__main__':
             )
 
             # --- aggregation: body+proj만 평균 (l3 제외) ---
-            total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            total_data_points = sum([len(net_dataidx_map_train[r]) for r in party_list_this_round])
+            fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in party_list_this_round]
 
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
@@ -1028,6 +1168,20 @@ if __name__ == '__main__':
             # --- history update: 참여한 cid만 snapshot 저장 (θ,ψ만) ---
             for cid in party_list_this_round:
                 fedcap_hist[cid].append(extract_body_proj_state(nets[cid]))  # <-- 여기서 extract_body_proj_state 사용
+
+            if (round + 1) % args.ckpt_every == 0:
+                ckpt_payload = {
+                    "round": round + 1,  # 다음 시작 라운드
+                    "global_model": global_model.state_dict(),
+                    "party_list_rounds": party_list_rounds,
+                    "rng_state": capture_rng_state(),
+                    "old_nets_pool": old_nets_pool,
+                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "net_dataidx_map_test": net_dataidx_map_test,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
+                }
+                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
+                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
 
     # ---- evaluation ----
     eval_clients = list(nets.keys())
