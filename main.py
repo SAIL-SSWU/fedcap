@@ -19,7 +19,7 @@ from utils import *
 
 # 저장 폴더 설정 (드라이브에 fed_runs폴더 하위에 기록)
 def get_run_dir(args):
-    base = "/content/drive/MyDrive/fed_runs" if os.path.exists("/content/drive/MyDrive") else "./fed_runs"
+    base = "/content/drive/Shareddrives/sail_seminar/3.experiments/fed_runs" if os.path.exists("/content/drive/Shareddrives/sail_seminar/3.experiments") else "./fed_runs"
     os.makedirs(base, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
