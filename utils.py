@@ -91,7 +91,7 @@ def record_net_data_stats(y_train, net_dataidx_map, logdir):
     return net_cls_counts
 
 
-def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4,
+def partition_data(dataset, datadir, logdir, partition, n_parties, beta,
                    holdout_ratio=0.2, seed=0):
     if dataset == 'cifar10':
         X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
@@ -100,7 +100,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4,
     elif dataset == 'tinyimagenet':
         X_train, y_train, X_test, y_test = load_tinyimagenet_data(datadir)
 
-    n_train = y_train.shape[0]
+    n_train = y_train.shape[0] # 학습 데이터 개수
 
     rng = np.random.RandomState(seed)
 
@@ -108,7 +108,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4,
     # 1) 기존처럼 train partition 생성
     # -------------------------
     if partition == "homo" or partition == "iid":
-        idxs = rng.permutation(n_train)
+        idxs = rng.permutation(n_train) # 0 ~ n_train-1까지의 인덱스를 랜덤하게 섞은 배열 생성
         batch_idxs = np.array_split(idxs, n_parties)
         net_dataidx_map = {i: batch_idxs[i].tolist() for i in range(n_parties)}
 
@@ -121,11 +121,11 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4,
         elif dataset == 'tinyimagenet':
             K = 200
 
-        N = y_train.shape[0]
+        N = y_train.shape[0] # 데이터 수
         net_dataidx_map = {}
 
         while min_size < min_require_size:
-            idx_batch = [[] for _ in range(n_parties)]
+            idx_batch = [[] for _ in range(n_parties)] # n_parties개의 빈 리스트 생성
             for k in range(K):
                 idx_k = np.where(y_train == k)[0]
                 rng.shuffle(idx_k)
@@ -224,8 +224,8 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, device="cpu"
         for loader in dataloader:
             with torch.no_grad():
                 for batch_idx, (x, target) in enumerate(loader):
-                    #print("x:",x)
-                    #print("target:",target)
+                    # print("x:", x)
+                    # print("target:", target)
                     if device != 'cpu':
                         x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
                     _, _, out = model(x)
@@ -359,7 +359,7 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, test_data
             ])
             transform_test = transforms.Compose([transforms.ToTensor(), normalize])
 
-        # ---- train split (client train) ----
+        # ---- train split (client train) ---- 클라이언트별로 데이터셋 
         train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
 
         # ---- test split ----

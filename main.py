@@ -9,14 +9,15 @@ import os
 import copy
 from datetime import datetime
 import random
-from eval_personalization import evaluate_personalization, evaluate_generalization_head_avg
 from collections import defaultdict, deque
 import copy
 import torch.nn.functional as F
+from eval_personalization import evaluate_personalization, evaluate_generalization_head_avg
 
 from model import *
 from utils import *
 
+# 저장 폴더 설정 (드라이브에 fed_runs폴더 하위에 기록)
 def get_run_dir(args):
     base = "/content/drive/MyDrive/fed_runs" if os.path.exists("/content/drive/MyDrive") else "./fed_runs"
     os.makedirs(base, exist_ok=True)
@@ -27,7 +28,7 @@ def get_run_dir(args):
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
-
+# 실험 저장
 def save_experiment(run_dir, args, global_model, g_acc, p_acc):
     # 모델 저장
     torch.save(global_model.state_dict(),
@@ -35,16 +36,15 @@ def save_experiment(run_dir, args, global_model, g_acc, p_acc):
 
     # args 저장
     with open(os.path.join(run_dir, "args.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(vars(args), f, indent=2) # args를 dict로(vars) -> json으로(json.dump) 
 
     # 결과 저장
     results = {
         "generalization_acc": float(g_acc),
         "personalization_acc": float(p_acc)
     }
-
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2) 
 
 def save_ckpt(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -53,7 +53,8 @@ def save_ckpt(path, payload):
 def load_ckpt(path, map_location="cpu"):
     return torch.load(path, map_location=map_location)
 
-def capture_rng_state():
+# 완전한 재현을 위한 난수 상태 저장 및 복원
+def capture_rng_state(): # 현재 모든 랜덤 상태 저장
     state = {
         "py_random": random.getstate(),
         "np_random": np.random.get_state(),
@@ -63,7 +64,7 @@ def capture_rng_state():
         state["cuda_rng"] = torch.cuda.get_rng_state_all()
     return state
 
-def restore_rng_state(state):
+def restore_rng_state(state): # 저장했던 랜덤 상태 복구
     random.setstate(state["py_random"])
     np.random.set_state(state["np_random"])
     torch.random.set_rng_state(state["torch_rng"])
@@ -74,19 +75,19 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='resnet50', help='neural network used in training')
     parser.add_argument('--dataset', type=str, default='cifar100', help='dataset used for training')
-    parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', '))))
+    parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', ')))) # 문자열을 정수 인덱스로
     parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate (default: 0.1)')
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=2, help='number of workers in a distributed cluster')
+    parser.add_argument('--n_parties', type=int, default=2, help='number of workers in a distributed cluster') # 전체 클라이언트 수
     parser.add_argument('--alg', type=str, default='fedavg',
                         help='communication strategy: fedavg/fedprox')
-    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
+    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication round')
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
     parser.add_argument('--datadir', type=str, required=False, default="./data/", help="Data directory")
-    parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength")
+    parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength") # 가중치 감쇠 (옵티마이저 레벨)
     parser.add_argument('--logdir', type=str, required=False, default="./logs/", help='Log directory path')
     parser.add_argument('--modeldir', type=str, required=False, default="./models/", help='Model directory path')
     parser.add_argument('--beta', type=float, default=0.5,
@@ -94,7 +95,7 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
     parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
-    parser.add_argument('--mu', type=float, default=1, help='the mu parameter for fedprox or moon')
+    parser.add_argument('--mu', type=float, default=1, help='the mu parameter for fedprox or moon or fedcap')
     parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
     parser.add_argument('--temperature', type=float, default=0.5, help='the temperature parameter for contrastive loss')
     parser.add_argument('--local_max_epoch', type=int, default=100, help='the number of epoch for local optimal training')
@@ -103,28 +104,25 @@ def get_args():
     parser.add_argument('--sample_fraction', type=float, default=1.0, help='how many clients are sampled in each round')
     parser.add_argument('--load_model_file', type=str, default=None, help='the model to load as global model')
     parser.add_argument('--load_pool_file', type=str, default=None, help='the old model pool path to load')
-    parser.add_argument('--load_model_round', type=int, default=None, help='how many rounds have executed for the loaded model')
+    # parser.add_argument('--load_model_round', type=int, default=None, help='how many rounds have executed for the loaded model')
     parser.add_argument('--load_first_net', type=int, default=1, help='whether load the first net as old net or not')
-    parser.add_argument('--normal_model', type=int, default=0, help='use normal model or aggregate model')
-    parser.add_argument('--loss', type=str, default='contrastive')
+    parser.add_argument('--normal_model', type=int, default=0, help='use normal model or aggregate model') # 0으로 세팅해서 ModelFedCon/ModelFedCon_noheader 사용
+    parser.add_argument('--loss', type=str, default='contrastive') # 이것도
     parser.add_argument('--save_model',type=int,default=0)
-    parser.add_argument('--use_project_head', type=int, default=1) # 안 쓸 때 0으로 세팅
-    parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
+    parser.add_argument('--use_project_head', type=int, default=1) # 프로젝션 헤드 안 쓸 때 0으로 세팅
+    # parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
     # ----- FedBABU / FedCAP evaluation hyperparameters -----
     parser.add_argument('--Kg', type=int, default=50,
                         help='number of head fine-tuning steps for generalization evaluation')
-
     parser.add_argument('--Kp', type=int, default=50,
                         help='number of head fine-tuning steps for personalization evaluation')
-
     parser.add_argument('--head_lr', type=float, default=0.01,
                         help='learning rate for head fine-tuning')
-
     parser.add_argument('--eval_every', type=int, default=0,
                         help='evaluate personalization every N rounds (0 = only final round)')
     parser.add_argument('--resume_ckpt', type=str, default=None, help='path to checkpoint .pth')
     parser.add_argument('--ckpt_every', type=int, default=5, help='save checkpoint every N rounds')
-    
+
     args = parser.parse_args()
     
     run_dir = get_run_dir(args)
@@ -158,7 +156,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
             else:
                 net = net.to(device)
             nets[net_i] = net
-    else:
+    else: # normal_model: 0
         for net_i in range(n_parties):
             if args.use_project_head:
                 net = ModelFedCon(args.model, args.out_dim, n_classes, net_configs)
@@ -168,7 +166,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
                 net.to(device)
             else:
                 net = net.to(device)
-            nets[net_i] = net
+            nets[net_i] = net # 클라이언트별 모델 초기화
 
     model_meta_data = []
     layer_type = []
@@ -181,6 +179,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
 def to_device(model, device):
     return model.to(device)
 
+# DataParallel로 감싸진 모델이면 안에 있는 진짜 모델을 꺼내주는 함수
 def unwrap_dp(model):
     return model.module if hasattr(model, "module") else model
 
@@ -188,8 +187,8 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
     # net = nn.DataParallel(net)
     # net.cuda()
     net = to_device(net, device)
-    logger.info('Training network %s' % str(net_id))
-    logger.info('n_training: %d' % len(train_dataloader))
+    logger.info('Training network %s' % str(net_id)) # 클라이언트 인덱스
+    logger.info('n_training: %d' % len(train_dataloader)) 
     logger.info('n_test: %d' % len(test_dataloader))
 
     train_acc,_ = compute_accuracy(net, train_dataloader, device=device)
@@ -328,8 +327,8 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
     # net = nn.DataParallel(net)
     # net.cuda()
     net = to_device(net, device)
-    logger.info('Training network %s' % str(net_id))
-    logger.info('n_training: %d' % len(train_dataloader))
+    logger.info('Training network %s' % str(net_id)) # 클라이언트 
+    logger.info('n_training: %d' % len(train_dataloader)) # 배치
     logger.info('n_test: %d' % len(test_dataloader))
 
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
@@ -433,8 +432,8 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
     for net_id, net in nets.items():
         dataidxs = net_dataidx_map[net_id]
 
-        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
-        train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs)
+        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs))) # 클라이언트 번호, 데이터 수
+        train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs) # 클라이언트별 데이터를 가져옴
         train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
@@ -492,8 +491,8 @@ def train_net_fedbabu(net_id, net, train_dataloader, test_dataloader, epochs, lr
     if hasattr(base, "l3"):
         for p in base.l3.parameters():
             p.requires_grad = False
-        else:
-            logger.warning("FedBABU: net has no attribute l3. (Check model definition)")
+    else:
+        logger.warning("FedBABU: net has no attribute l3. (Check model definition)")
 
     # 2) optimizer: requires_grad=True만 학습 (head 자동 제외)
     if args_optimizer == 'adam':
@@ -640,11 +639,10 @@ if __name__ == '__main__':
     with open(os.path.join(args.logdir, argument_path), 'w') as f:
         json.dump(str(args), f)
     device = torch.device(args.device)
+
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    if args.log_file_name is None:
-        args.log_file_name = 'experiment_log-%s' % (datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
     log_path = args.log_file_name + '.log'
     logging.basicConfig(
         filename=os.path.join(args.logdir, log_path),
@@ -684,9 +682,9 @@ if __name__ == '__main__':
     train_dl_global, test_dl, train_ds_global, test_ds_global = get_dataloader(args.dataset,
                                                                                args.datadir,
                                                                                args.batch_size,
-                                                                               32)
+                                                                               32) # 전체 데이터셋 로딩
 
-    print("len train_dl_global:", len(train_ds_global))
+    print("len train_dl_global:", len(train_ds_global)) # 전체 데이터셋 크기
     train_dl=None
     data_size = len(test_ds_global)
 
@@ -725,29 +723,30 @@ if __name__ == '__main__':
             net_dataidx_map_test = ckpt["net_dataidx_map_test"]
 
     # ===== after global_model is defined =====
+    # head 인지 여부
     def is_head_key(k: str) -> bool:
         return k.startswith("l3.") or k.startswith("module.l3.")
-
+    # head 파라미터만 복사해서 반환
     def extract_head_sd(model):
         sd = model.state_dict()
         return {k: v.detach().clone() for k, v in sd.items() if is_head_key(k)}
-
+    # 저장해둔 헤드만 다시 모델에 덮어쓰기
     def load_head_sd(model, head_sd):
         sd = model.state_dict()
         for k, v in head_sd.items():
             sd[k] = v
         model.load_state_dict(sd)
-
+    # 고정된 헤드 글로벌 모델 + 클라이언트 모델에 똑같이 덮어씌움
     def broadcast_fixed_head(nets, global_model, fixed_head_sd):
-        load_head_sd(global_model, fixed_head_sd)
+        load_head_sd(global_model, fixed_head_sd) # 글로벌 모델에 헤드 덮어씌움
         for cid in nets.keys():
-            load_head_sd(nets[cid], fixed_head_sd)
-            
+            load_head_sd(nets[cid], fixed_head_sd) # 클라이언트에게 헤드 덮어씌움
+    # dict of list로 변환(저장하기 위해)
     def serialize_fedcap_hist(fedcap_hist):
         if fedcap_hist is None:
             return None
         return {cid: list(deq) for cid, deq in fedcap_hist.items()}
-
+    # 원래 쓰던 구조로 복원
     def deserialize_fedcap_hist(obj, maxlen):
         if obj is None:
             return None
@@ -757,13 +756,13 @@ if __name__ == '__main__':
         return dd
         
 
-    # ---- create fixed shared head once ----
+    # create fixed shared head once
     fixed_head_sd = None
     if args.alg in ["fedbabu", "fedcap"]:
         fixed_head_sd = extract_head_sd(global_model)  # <- global head를 기준으로
         broadcast_fixed_head(nets, global_model, fixed_head_sd)
         logger.info("FedBABU/FedCAP: FIXED shared random head is broadcast to all clients.")
-
+    # 바디만 로드
     def load_body_only(net, global_w):
         local_w = net.state_dict()
         for k in global_w:
@@ -885,7 +884,8 @@ if __name__ == '__main__':
                     "party_list_rounds": party_list_rounds,
                     "rng_state": capture_rng_state(),
                     "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    
+                    "net_dataidx_map_train": net_dataidx_map_train,
                     "net_dataidx_map_test": net_dataidx_map_test,
                 }
                 save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
@@ -951,7 +951,8 @@ if __name__ == '__main__':
                     "party_list_rounds": party_list_rounds,
                     "rng_state": capture_rng_state(),
                     "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    "net_dataidx_map_train": net_dataidx_map_train,
+                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    
+                    "net_dataidx_map_train": net_dataidx_map_train,
                     "net_dataidx_map_test": net_dataidx_map_test,
                 }
                 save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)

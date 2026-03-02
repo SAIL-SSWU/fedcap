@@ -54,7 +54,7 @@ def finetune_head_steps(model, train_loader, K, lr, device="cuda"):
     model.to(device)
     model.train()
 
-    # BN running stats 고정 (강추)
+    # BN running stats 고정
     freeze_bn_stats(model)
 
     # head key sanity check
@@ -128,7 +128,7 @@ def evaluate_personalization(
     compute_accuracy_fn=None,
     test_dl=None,               # fallback용 global test loader
     args=None,
-    Kp=50,
+    Kp=15,
     head_lr=0.01,
     device="cuda"
 ):
@@ -211,8 +211,8 @@ def evaluate_generalization_head_avg(
     compute_accuracy_fn,
     test_dl,
     args,
-    Kg=50,
-    head_lr=0.01,
+    Kg,
+    head_lr,
     device="cuda"
 ):
     global_sd = copy.deepcopy(global_model.state_dict())
