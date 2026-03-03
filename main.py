@@ -19,7 +19,7 @@ from utils import *
 
 # 저장 폴더 설정 (드라이브에 fed_runs폴더 하위에 기록)
 def get_run_dir(args):
-    base = "/content/drive/Shareddrives/sail_seminar/3.experiments/fed_runs" if os.path.exists("/content/drive/Shareddrives/sail_seminar/3.experiments") else "./fed_runs"
+    base = "/content/drive/MyDrive/experiment/sail_seminar/3.experiment/fed_runs" if os.path.exists("/content/drive/MyDrive/experiment/sail_seminar/3.experiment") else "./fed_runs"
     os.makedirs(base, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -110,7 +110,7 @@ def get_args():
     parser.add_argument('--loss', type=str, default='contrastive') # 이것도
     parser.add_argument('--save_model',type=int,default=0)
     parser.add_argument('--use_project_head', type=int, default=1) # 프로젝션 헤드 안 쓸 때 0으로 세팅
-    # parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
+    parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
     # ----- FedBABU / FedCAP evaluation hyperparameters -----
     parser.add_argument('--Kg', type=int, default=50,
                         help='number of head fine-tuning steps for generalization evaluation')
@@ -633,10 +633,10 @@ if __name__ == '__main__':
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
     if args.log_file_name is None:
-        argument_path = 'experiment_arguments-%s.json' % datetime.now().strftime("%Y-%m-%d-%H%M-%S")
+        args.log_file_name = 'experiment_arguments-%s.json' % datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     else:
-        argument_path = args.log_file_name + '.json'
-    with open(os.path.join(args.logdir, argument_path), 'w') as f:
+        args.log_file_name = args.log_file_name + '.json'
+    with open(os.path.join(args.logdir, args.log_file_name), 'w') as f:
         json.dump(str(args), f)
     device = torch.device(args.device)
 
