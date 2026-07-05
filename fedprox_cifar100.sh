@@ -1,0 +1,1 @@
+python main.py --alg fedprox --dataset cifar100 --model resnet50-cifar100 --partition noniid --beta 0.5 --n_parties 100 --sample_fraction 0.2 --comm_round 250 --epochs 10 --batch-size 64 --optimizer sgd --lr 0.01 --reg 1e-5 --use_project_head 0 --device cuda:0 --init_seed 0 --Kg 15 --Kp 15 --logdir ./logs --mu 0.01 --temperature 0 

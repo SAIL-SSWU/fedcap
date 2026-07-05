@@ -357,21 +357,52 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, test_data
                 transforms.ToTensor(),
                 normalize
             ])
-            transform_test = transforms.Compose([transforms.ToTensor(), normalize])
+            transform_test = transforms.Compose([
+                transforms.ToTensor(),
+                normalize
+            ])
 
-        # ---- train split (client train) ---- 클라이언트별로 데이터셋 
-        train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
+        train_ds = dl_obj(
+            datadir,
+            dataidxs=dataidxs,
+            train=True,
+            transform=transform_train,
+            download=False
+        )
 
-        # ---- test split ----
-        # 1) client-local test (from TRAIN set indices)
         if test_dataidxs is not None:
-            test_ds = dl_obj(datadir, dataidxs=test_dataidxs, train=True, transform=transform_test, download=True)
-        # 2) global test (official test set)
+            test_ds = dl_obj(
+                datadir,
+                dataidxs=test_dataidxs,
+                train=True,
+                transform=transform_test,
+                download=False
+            )
         else:
-            test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+            test_ds = dl_obj(
+                datadir,
+                train=False,
+                transform=transform_test,
+                download=False
+            )
 
-        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
-        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
+        train_dl = data.DataLoader(
+            dataset=train_ds,
+            batch_size=train_bs,
+            drop_last=True,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False
+        )
+
+        test_dl = data.DataLoader(
+            dataset=test_ds,
+            batch_size=test_bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False
+        )
+
         return train_dl, test_dl, train_ds, test_ds
 
     else:

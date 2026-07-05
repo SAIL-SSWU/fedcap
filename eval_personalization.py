@@ -50,7 +50,7 @@ def freeze_bn_stats(model):
         if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             m.eval()
 
-def finetune_head_steps(model, train_loader, K, lr, device="cuda"):
+def finetune_head_steps(model, train_loader, K, lr, weight_decay=1e-3, device="cuda"):
     model.to(device)
     model.train()
 
@@ -72,7 +72,7 @@ def finetune_head_steps(model, train_loader, K, lr, device="cuda"):
         model.to("cpu")
         return
 
-    optimizer = optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0)
+    optimizer = optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss().to(device)
 
     step = 0
@@ -130,74 +130,140 @@ def evaluate_personalization(
     args=None,
     Kp=15,
     head_lr=0.01,
+    head_weight_decay=1e-3,
     device="cuda"
 ):
+    import copy
+    import torch
+
     global_sd = copy.deepcopy(global_model.state_dict())
     accs = []
 
-    logger.info(f"[PersEval] clients={len(client_list)} Kp={Kp} head_lr={head_lr} device={device}")
+    # device 정리
+    if isinstance(device, str):
+        eval_device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    else:
+        eval_device = device
+
+    logger.info(f"[PersEval] clients={len(client_list)} Kp={Kp} head_lr={head_lr} device={eval_device}")
 
     for cid in client_list:
         local = copy.deepcopy(nets[cid])
 
         n_train = len(net_dataidx_map_train[cid])
-        n_test_local = len(net_dataidx_map_test[cid]) if (net_dataidx_map_test is not None and cid in net_dataidx_map_test) else -1
+        n_test_local = (
+            len(net_dataidx_map_test[cid])
+            if (net_dataidx_map_test is not None and cid in net_dataidx_map_test)
+            else -1
+        )
         logger.info(f"[PersEval] cid={cid} n_train_samples={n_train} n_test_samples={n_test_local}")
 
         # 1) global 전체 로드
         overwrite_from_global(local, global_sd)
 
         # 2) 로컬 train/test loader 둘 다 받기
-        #    - get_dataloader_fn이 client별 test를 만들려면 "test_dataidxs" 같은 인자를 받아야 함.
-        #    - 너의 현재 get_dataloader()는 test_ds를 통째로 쓰는 구조라면, 아래의 test_dataidxs는 무시될 수 있음.
         if net_dataidx_map_test is not None and cid in net_dataidx_map_test:
             train_dl_local, test_dl_local, _, _ = get_dataloader_fn(
-                args.dataset, args.datadir,
-                args.batch_size, 32,
+                args.dataset,
+                args.datadir,
+                args.batch_size,
+                32,
                 dataidxs=net_dataidx_map_train[cid],
                 test_dataidxs=net_dataidx_map_test[cid],   # client test
             )
         else:
             train_dl_local, test_dl_local, _, _ = get_dataloader_fn(
-                args.dataset, args.datadir,
-                args.batch_size, 32,
-                dataidxs=net_dataidx_map_train[cid]
+                args.dataset,
+                args.datadir,
+                args.batch_size,
+                32,
+                dataidxs=net_dataidx_map_train[cid],
             )
 
-        # 3) (선택) 로컬 test loader가 None이거나 비어있으면 fallback
+        # 3) 로컬 test loader가 None이면 fallback
         if test_dl_local is None:
             logger.warning(f"[PersEval] cid={cid} test_dl_local is None. Falling back to provided test_dl.")
             test_dl_local = test_dl
 
-        # 4) FT 전: "클라이언트별 test"로 평가
-        local.to(device)
-        pre_acc, _, _ = compute_accuracy_fn(local, test_dl_local, get_confusion_matrix=True, device=device)
-        pre_norm = _head_norm(local)
-        local.to("cpu")
-        logger.info(f"[PersEval] cid={cid} pre_acc={pre_acc:.4f} head_norm(pre)={pre_norm:.4f}")
+        # 4) FT 전: train + test 평가
+        local.to(eval_device)
 
-        # 5) head FT (client train)
-        finetune_head_steps(local, train_dl_local, K=Kp, lr=head_lr, device=device)
-
-        # 6) FT 후: "클라이언트별 test"로 평가
-        local.to(device)
-        post_acc, _, _ = compute_accuracy_fn(local, test_dl_local, get_confusion_matrix=True, device=device)
-        post_norm = _head_norm(local)
-        local.to("cpu")
-        logger.info(
-            f"[PersEval] cid={cid} post_acc={post_acc:.4f} head_norm(post)={post_norm:.4f} "
-            f"delta_norm={post_norm - pre_norm:.4f}"
+        # test는 confusion matrix 포함 -> 3개 반환
+        pre_test_acc, _, _ = compute_accuracy_fn(
+            local,
+            test_dl_local,
+            get_confusion_matrix=True,
+            device=eval_device
         )
 
-        accs.append(post_acc)
+        # train은 confusion matrix 없음 -> 2개 반환
+        pre_train_acc, _ = compute_accuracy_fn(
+            local,
+            train_dl_local,
+            get_confusion_matrix=False,
+            device=eval_device
+        )
+
+        pre_norm = _head_norm(local)
+        pre_gap = pre_train_acc - pre_test_acc
+
+        local.to("cpu")
+        logger.info(
+            f"[PersEval] cid={cid} "
+            f"pre_test_acc={pre_test_acc:.4f} pre_train_acc={pre_train_acc:.4f} "
+            f"pre_gap(train-test)={pre_gap:.4f} "
+            f"head_norm(pre)={pre_norm:.4f}"
+        )
+
+        # 5) head FT (client train)
+        finetune_head_steps(local, train_dl_local, K=Kp, lr=head_lr, weight_decay=head_weight_decay, device=eval_device)
+
+        # 6) FT 후: train + test 평가
+        local.to(eval_device)
+
+        # test는 confusion matrix 포함 -> 3개 반환
+        post_test_acc, _, _ = compute_accuracy_fn(
+            local,
+            test_dl_local,
+            get_confusion_matrix=True,
+            device=eval_device
+        )
+
+        # train은 confusion matrix 없음 -> 2개 반환
+        post_train_acc, _ = compute_accuracy_fn(
+            local,
+            train_dl_local,
+            get_confusion_matrix=False,
+            device=eval_device
+        )
+
+        post_norm = _head_norm(local)
+        post_gap = post_train_acc - post_test_acc
+        gain = post_test_acc - pre_test_acc
+        train_gain = post_train_acc - pre_train_acc
+        delta_norm = post_norm - pre_norm
+
+        local.to("cpu")
+        logger.info(
+            f"[PersEval] cid={cid} "
+            f"post_test_acc={post_test_acc:.4f} post_train_acc={post_train_acc:.4f} "
+            f"gain={gain:.4f} train_gain={train_gain:.4f} "
+            f"head_norm(post)={post_norm:.4f} delta_norm={delta_norm:.4f}"
+        )
+        logger.info(
+            f"[PersEval] cid={cid} "
+            f"post_gap(train-test)={post_gap:.4f}"
+        )
+
+        accs.append(post_test_acc)
 
     mean_acc = sum(accs) / len(accs) if len(accs) else 0.0
     if len(accs) > 0:
         logger.info(f"[PersEval] mean={mean_acc:.4f} min={min(accs):.4f} max={max(accs):.4f}")
     else:
         logger.info(f"[PersEval] mean={mean_acc:.4f} (no clients)")
-    return mean_acc, accs
 
+    return mean_acc, accs
 
 # -----------------------------
 # Generalization Evaluation
@@ -213,6 +279,7 @@ def evaluate_generalization_head_avg(
     args,
     Kg,
     head_lr,
+    head_weight_decay=1e-4,
     device="cuda"
 ):
     global_sd = copy.deepcopy(global_model.state_dict())
@@ -231,7 +298,7 @@ def evaluate_generalization_head_avg(
         )
 
         pre_norm = _head_norm(local)
-        finetune_head_steps(local, train_dl_local, K=Kg, lr=head_lr, device=device)
+        finetune_head_steps(local, train_dl_local, K=Kg, lr=head_lr, weight_decay=head_weight_decay, device=device)
         post_norm = _head_norm(local)
 
         head_sds.append(extract_head_sd(local))

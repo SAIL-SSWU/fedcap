@@ -1,0 +1,1 @@
+python main.py --alg moon --dataset cifar10 --model resnet18-cifar10 --partition noniid --beta 0.5 --n_parties 100 --sample_fraction 0.1 --comm_round 100 --epochs 10 --batch-size 64 --optimizer sgd --lr 0.01 --reg 1e-5 --device cuda:0 --init_seed 0 --Kg 15 --Kp 15 --logdir ./logs --mu 1 --temperature 0.5 --use_project_head 1

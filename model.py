@@ -542,7 +542,7 @@ class ModelFedCon(nn.Module):
             basemodel = ResNet50_cifar10()
             self.features = nn.Sequential(*list(basemodel.children())[:-1])
             num_ftrs = basemodel.fc.in_features
-        elif base_model == "resnet18-cifar10" or base_model == "resnet18":
+        elif base_model == "resnet18-cifar100" or base_model == "resnet18" or base_model == "resnet-cifar10":
             basemodel = ResNet18_cifar10()
             self.features = nn.Sequential(*list(basemodel.children())[:-1])
             num_ftrs = basemodel.fc.in_features
@@ -604,7 +604,7 @@ class ModelFedCon_noheader(nn.Module):
             basemodel = ResNet50_cifar10()
             self.features = nn.Sequential(*list(basemodel.children())[:-1])
             num_ftrs = basemodel.fc.in_features
-        elif base_model == "resnet18-cifar10":
+        elif base_model in ["resnet18-cifar10", "resnet18-cifar100"]:
             basemodel = ResNet18_cifar10()
             self.features = nn.Sequential(*list(basemodel.children())[:-1])
             num_ftrs = basemodel.fc.in_features

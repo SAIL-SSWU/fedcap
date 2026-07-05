@@ -19,7 +19,9 @@ from utils import *
 
 # 저장 폴더 설정 (드라이브에 fed_runs폴더 하위에 기록)
 def get_run_dir(args):
-    base = "/content/drive/MyDrive/experiment/sail_seminar/3.experiment/fed_runs" if os.path.exists("/content/drive/MyDrive/experiment/sail_seminar/3.experiment") else "./fed_runs"
+    project_root = os.path.dirname(os.path.abspath(__file__))   # 이 파일 기준
+    base_root = os.path.dirname(project_root)                   # 한 단계 위
+    base = os.path.join(base_root, "fed_runs")
     os.makedirs(base, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -45,6 +47,29 @@ def save_experiment(run_dir, args, global_model, g_acc, p_acc):
     }
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2) 
+
+def save_resume_ckpt(run_dir, round, args, global_model, party_list_rounds,
+                     old_nets_pool, fedcap_hist,
+                     net_dataidx_map_train, net_dataidx_map_test):
+    if args.ckpt_every <= 0:
+        return
+
+    if (round + 1) % args.ckpt_every != 0:
+        return
+
+    ckpt_payload = {
+        "round": round + 1,
+        "global_model": global_model.state_dict(),
+        "party_list_rounds": party_list_rounds,
+        "rng_state": capture_rng_state(),
+        "old_nets_pool": old_nets_pool,
+        "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
+        "net_dataidx_map_train": net_dataidx_map_train,
+        "net_dataidx_map_test": net_dataidx_map_test,
+    }
+
+    ckpt_dir = os.path.join(run_dir, "ckpt")
+    save_ckpt(os.path.join(ckpt_dir, "latest.pth"), ckpt_payload)
 
 def save_ckpt(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -104,7 +129,7 @@ def get_args():
     parser.add_argument('--sample_fraction', type=float, default=1.0, help='how many clients are sampled in each round')
     parser.add_argument('--load_model_file', type=str, default=None, help='the model to load as global model')
     parser.add_argument('--load_pool_file', type=str, default=None, help='the old model pool path to load')
-    # parser.add_argument('--load_model_round', type=int, default=None, help='how many rounds have executed for the loaded model')
+    parser.add_argument('--load_model_round', type=int, default=0, help='how many rounds have executed for the loaded model')
     parser.add_argument('--load_first_net', type=int, default=1, help='whether load the first net as old net or not')
     parser.add_argument('--normal_model', type=int, default=0, help='use normal model or aggregate model') # 0으로 세팅해서 ModelFedCon/ModelFedCon_noheader 사용
     parser.add_argument('--loss', type=str, default='contrastive') # 이것도
@@ -121,7 +146,7 @@ def get_args():
     parser.add_argument('--eval_every', type=int, default=0,
                         help='evaluate personalization every N rounds (0 = only final round)')
     parser.add_argument('--resume_ckpt', type=str, default=None, help='path to checkpoint .pth')
-    parser.add_argument('--ckpt_every', type=int, default=5, help='save checkpoint every N rounds')
+    parser.add_argument('--ckpt_every', type=int, default=50, help='save checkpoint every N rounds')
 
     args = parser.parse_args()
     
@@ -182,6 +207,8 @@ def to_device(model, device):
 # DataParallel로 감싸진 모델이면 안에 있는 진짜 모델을 꺼내주는 함수
 def unwrap_dp(model):
     return model.module if hasattr(model, "module") else model
+
+
 
 def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu"):
     # net = nn.DataParallel(net)
@@ -322,47 +349,73 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
     return train_acc, test_acc
 
 
-def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args,
-                      round, device="cpu"):
-    # net = nn.DataParallel(net)
-    # net.cuda()
+def train_net_fedcon(net_id, net, global_net, previous_nets,
+                     train_dataloader, test_dataloader,
+                     epochs, lr, args_optimizer, mu, temperature, args,
+                     round, device="cpu"):
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+
     net = to_device(net, device)
-    logger.info('Training network %s' % str(net_id)) # 클라이언트 
-    logger.info('n_training: %d' % len(train_dataloader)) # 배치
+
+    logger.info('Training network %s' % str(net_id))
+    logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
 
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
-
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
     logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
     logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
 
-
     if args_optimizer == 'adam':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, net.parameters()),
+            lr=lr,
+            weight_decay=args.reg
+        )
     elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, net.parameters()),
+            lr=lr,
+            weight_decay=args.reg,
+            amsgrad=True
+        )
     elif args_optimizer == 'sgd':
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
-                              weight_decay=args.reg)
+        optimizer = optim.SGD(
+            filter(lambda p: p.requires_grad, net.parameters()),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=args.reg
+        )
 
     criterion = nn.CrossEntropyLoss().to(device)
-    # global_net.to(device)
+    cos = torch.nn.CosineSimilarity(dim=-1)
+
+    global_net = to_device(global_net, device)
+    global_net.eval()
+    for p in global_net.parameters():
+        p.requires_grad = False
 
     for previous_net in previous_nets:
         previous_net.to(device)
-    global_w = global_net.state_dict()
+        previous_net.eval()
+        for p in previous_net.parameters():
+            p.requires_grad = False
 
     cnt = 0
-    cos=torch.nn.CosineSimilarity(dim=-1)
-    # mu = 0.001
 
     for epoch in range(epochs):
         epoch_loss_collector = []
         epoch_loss1_collector = []
         epoch_loss2_collector = []
+
+        epoch_pos_collector = []
+        epoch_neg_collector = []
+        epoch_gap_collector = []
+
         for batch_idx, (x, target) in enumerate(train_dataloader):
             x, target = x.to(device), target.to(device)
 
@@ -371,25 +424,40 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             target.requires_grad = False
             target = target.long()
 
+            # local forward
             _, pro1, out = net(x)
-            _, pro2, _ = global_net(x)
+
+            # positive: current global model
+            with torch.no_grad():
+                _, pro2, _ = global_net(x)
 
             posi = cos(pro1, pro2)
-            logits = posi.reshape(-1,1)
+            logits = posi.reshape(-1, 1)
 
-            for previous_net in previous_nets:
-                previous_net.to(device)
-                _, pro3, _ = previous_net(x)
-                nega = cos(pro1, pro3)
-                logits = torch.cat((logits, nega.reshape(-1,1)), dim=1)
+            batch_pos_mean = posi.mean().item()
+            batch_neg_means = []
 
-                previous_net.to('cpu')
+            # negatives: previous local models
+            if previous_nets is not None and len(previous_nets) > 0:
+                for previous_net in previous_nets:
+                    with torch.no_grad():
+                        _, pro3, _ = previous_net(x)
 
-            logits /= temperature
-            labels = torch.zeros(x.size(0), device=device).long()
+                    nega = cos(pro1, pro3)
+                    logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
+                    batch_neg_means.append(nega.mean().item())
 
-            loss2 = mu * criterion(logits, labels)
+                logits /= temperature
+                labels = torch.zeros(x.size(0), device=device).long()
+                loss2 = mu * criterion(logits, labels)
 
+                batch_neg_mean = float(np.mean(batch_neg_means))
+                batch_gap_mean = batch_pos_mean - batch_neg_mean
+
+                epoch_neg_collector.append(batch_neg_mean)
+                epoch_gap_collector.append(batch_gap_mean)
+            else:
+                loss2 = torch.tensor(0.0, device=device)
 
             loss1 = criterion(out, target)
             loss = loss1 + loss2
@@ -401,20 +469,32 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             epoch_loss_collector.append(loss.item())
             epoch_loss1_collector.append(loss1.item())
             epoch_loss2_collector.append(loss2.item())
+            epoch_pos_collector.append(batch_pos_mean)
 
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         epoch_loss1 = sum(epoch_loss1_collector) / len(epoch_loss1_collector)
         epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
-        logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
 
+        epoch_pos = sum(epoch_pos_collector) / len(epoch_pos_collector) if epoch_pos_collector else float("nan")
+        epoch_neg = sum(epoch_neg_collector) / len(epoch_neg_collector) if epoch_neg_collector else float("nan")
+        epoch_gap = sum(epoch_gap_collector) / len(epoch_gap_collector) if epoch_gap_collector else float("nan")
+
+        logger.info(
+            'Epoch: %d Loss: %f Loss1: %f Loss2: %f PosSim: %f NegSim: %f Gap: %f'
+            % (epoch, epoch_loss, epoch_loss1, epoch_loss2, epoch_pos, epoch_neg, epoch_gap)
+        )
 
     for previous_net in previous_nets:
         previous_net.to('cpu')
+
+    global_net.to('cpu')
+
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
+
     net.to('cpu')
     logger.info(' ** Training complete **')
     return train_acc, test_acc
@@ -434,7 +514,6 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
 
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs))) # 클라이언트 번호, 데이터 수
         train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs) # 클라이언트별 데이터를 가져옴
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         n_epoch = args.epochs
 
         if args.alg == 'fedavg':
@@ -570,6 +649,10 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
         p.requires_grad = False
 
     for epoch in range(epochs):
+        epoch_pos_collector = []
+        epoch_neg_collector = []
+        epoch_gap_collector = []
+
         epoch_loss_collector = []
         epoch_loss1_collector = []
         epoch_loss2_collector = []
@@ -588,6 +671,9 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
             posi = cos(pro1, pro2)
             logits = posi.reshape(-1, 1)
 
+            batch_pos_mean = posi.mean().item()
+            batch_neg_means = []
+
             # negatives: self-history snapshots
             if previous_snapshots is not None and len(previous_snapshots) > 0:
                 for snap in previous_snapshots:
@@ -597,9 +683,17 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
                     nega = cos(pro1, pro3)
                     logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
 
+                    batch_neg_means.append(nega.mean().item())
+
                 logits /= temperature
                 labels = torch.zeros(x.size(0), device=device).long()  # positive가 0번 컬럼
                 loss2 = mu * criterion(logits, labels)
+
+                batch_neg_mean = float(np.mean(batch_neg_means))
+                batch_gap_mean = batch_pos_mean - batch_neg_mean
+
+                epoch_neg_collector.append(batch_neg_mean)
+                epoch_gap_collector.append(batch_gap_mean)
             else:
                 # history가 없으면 contrastive 없음
                 loss2 = torch.tensor(0.0, device=x.device)
@@ -614,11 +708,16 @@ def train_net_fedcap(net_id, net, global_net, previous_snapshots,
             epoch_loss_collector.append(loss.item())
             epoch_loss1_collector.append(loss1.item())
             epoch_loss2_collector.append(loss2.item())
+            epoch_pos_collector.append(batch_pos_mean)
 
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         epoch_loss1 = sum(epoch_loss1_collector) / len(epoch_loss1_collector)
         epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
-        logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
+        epoch_pos = sum(epoch_pos_collector) / len(epoch_pos_collector) if epoch_pos_collector else float("nan")
+        epoch_neg = sum(epoch_neg_collector) / len(epoch_neg_collector) if epoch_neg_collector else float("nan")
+        epoch_gap = sum(epoch_gap_collector) / len(epoch_gap_collector) if epoch_gap_collector else float("nan")
+
+        logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f PosSim: %f NegSim: %f Gap: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2, epoch_pos, epoch_neg, epoch_gap))
     
     logger.info(' ** FedCAP Training complete **')
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
@@ -634,8 +733,7 @@ if __name__ == '__main__':
     mkdirs(args.modeldir)
     if args.log_file_name is None:
         args.log_file_name = 'experiment_arguments-%s.json' % datetime.now().strftime("%Y-%m-%d-%H%M-%S")
-    else:
-        args.log_file_name = args.log_file_name + '.json'
+
     with open(os.path.join(args.logdir, args.log_file_name), 'w') as f:
         json.dump(str(args), f)
     device = torch.device(args.device)
@@ -798,6 +896,8 @@ if __name__ == '__main__':
                     for param in net.parameters():
                         param.requires_grad = False
                 old_nets_pool.append(old_nets)
+        init_l3_weight = global_model.state_dict()['l3.weight'].detach().cpu().clone()
+        global_l3_drift_list = []
         for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
@@ -877,20 +977,18 @@ if __name__ == '__main__':
                 for nets_id, old_nets in enumerate(old_nets_pool):
                     torch.save({'pool'+ str(nets_id) + '_'+'net'+str(net_id): net.state_dict() for net_id, net in old_nets.items()}, args.modeldir+'fedcon/prev_model_pool_'+args.log_file_name+'.pth')
             
-            if (round + 1) % args.ckpt_every == 0:
-                ckpt_payload = {
-                    "round": round + 1,  # 다음 시작 라운드
-                    "global_model": global_model.state_dict(),
-                    "party_list_rounds": party_list_rounds,
-                    "rng_state": capture_rng_state(),
-                    "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    
-                    "net_dataidx_map_train": net_dataidx_map_train,
-                    "net_dataidx_map_test": net_dataidx_map_test,
-                }
-                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
-                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
-        
+            save_resume_ckpt(
+                run_dir, round, args, global_model, party_list_rounds,
+                old_nets_pool, fedcap_hist,
+                net_dataidx_map_train, net_dataidx_map_test
+            )
+            curr_l3_weight = global_model.state_dict()['l3.weight'].detach().cpu() 
+            l3_drift = torch.norm(curr_l3_weight - init_l3_weight, p=2).item() 
+            global_l3_drift_list.append(l3_drift) 
+            logger.info('[L3Drift] round=%d cum=%f' % (round, l3_drift)) 
+        with open(os.path.join(run_dir, 'global_l3_drift.json'), 'w') as f: 
+          json.dump({"cumulative_drift": global_l3_drift_list}, f, indent=2)
+
     elif args.alg == 'fedavg':
         for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
@@ -944,19 +1042,11 @@ if __name__ == '__main__':
             torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
 
-            if (round + 1) % args.ckpt_every == 0:
-                ckpt_payload = {
-                    "round": round + 1,  # 다음 시작 라운드
-                    "global_model": global_model.state_dict(),
-                    "party_list_rounds": party_list_rounds,
-                    "rng_state": capture_rng_state(),
-                    "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),                    
-                    "net_dataidx_map_train": net_dataidx_map_train,
-                    "net_dataidx_map_test": net_dataidx_map_test,
-                }
-                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
-                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+            save_resume_ckpt(
+                run_dir, round, args, global_model, party_list_rounds,
+                old_nets_pool, fedcap_hist,
+                net_dataidx_map_train, net_dataidx_map_test
+            )
     
     elif args.alg == 'fedprox':
 
@@ -1001,19 +1091,11 @@ if __name__ == '__main__':
             global_model.to('cpu')
             torch.save(global_model.state_dict(), args.modeldir +'fedprox/'+args.log_file_name+ '.pth')
 
-            if (round + 1) % args.ckpt_every == 0:
-                ckpt_payload = {
-                    "round": round + 1,  # 다음 시작 라운드
-                    "global_model": global_model.state_dict(),
-                    "party_list_rounds": party_list_rounds,
-                    "rng_state": capture_rng_state(),
-                    "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
-                    "net_dataidx_map_train": net_dataidx_map_train,
-                    "net_dataidx_map_test": net_dataidx_map_test,
-                }
-                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
-                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+            save_resume_ckpt(
+                run_dir, round, args, global_model, party_list_rounds,
+                old_nets_pool, fedcap_hist,
+                net_dataidx_map_train, net_dataidx_map_test
+            )
 
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
@@ -1074,19 +1156,11 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
-            if (round + 1) % args.ckpt_every == 0:
-                ckpt_payload = {
-                    "round": round + 1,  # 다음 시작 라운드
-                    "global_model": global_model.state_dict(),
-                    "party_list_rounds": party_list_rounds,
-                    "rng_state": capture_rng_state(),
-                    "old_nets_pool": old_nets_pool,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
-                    "net_dataidx_map_train": net_dataidx_map_train,
-                    "net_dataidx_map_test": net_dataidx_map_test,
-                }
-                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
-                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+            save_resume_ckpt(
+                run_dir, round, args, global_model, party_list_rounds,
+                old_nets_pool, fedcap_hist,
+                net_dataidx_map_train, net_dataidx_map_test
+            )
     # fedcap
     elif args.alg == 'fedcap':
         if fedcap_hist is None:
@@ -1099,6 +1173,8 @@ if __name__ == '__main__':
         # (옵션) load_first_net이면 첫 라운드 history 초기화(비어있어도 상관없어서 없어도 됨)
         # 보통은 비워두고 시작해도 OK
 
+        init_l3_weight = global_model.state_dict()['l3.weight'].detach().cpu().clone()
+        global_l3_drift_list = []
         for round in range(start_round, n_comm_rounds):
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
@@ -1170,19 +1246,17 @@ if __name__ == '__main__':
             for cid in party_list_this_round:
                 fedcap_hist[cid].append(extract_body_proj_state(nets[cid]))  # <-- 여기서 extract_body_proj_state 사용
 
-            if (round + 1) % args.ckpt_every == 0:
-                ckpt_payload = {
-                    "round": round + 1,  # 다음 시작 라운드
-                    "global_model": global_model.state_dict(),
-                    "party_list_rounds": party_list_rounds,
-                    "rng_state": capture_rng_state(),
-                    "old_nets_pool": old_nets_pool,
-                    "net_dataidx_map_train": net_dataidx_map_train,
-                    "net_dataidx_map_test": net_dataidx_map_test,
-                    "fedcap_hist": serialize_fedcap_hist(fedcap_hist),
-                }
-                save_ckpt(os.path.join(run_dir, "ckpt", f"ckpt_round{round+1}.pth"), ckpt_payload)
-                save_ckpt(os.path.join(run_dir, "ckpt", "latest.pth"), ckpt_payload)
+            save_resume_ckpt(
+                run_dir, round, args, global_model, party_list_rounds,
+                old_nets_pool, fedcap_hist,
+                net_dataidx_map_train, net_dataidx_map_test
+            )
+            curr_l3_weight = global_model.state_dict()['l3.weight'].detach().cpu() 
+            l3_drift = torch.norm(curr_l3_weight - init_l3_weight, p=2).item() 
+            global_l3_drift_list.append(l3_drift) 
+            logger.info('[L3Drift] round=%d cum=%f' % (round, l3_drift)) 
+        with open(os.path.join(run_dir, 'global_l3_drift.json'), 'w') as f: 
+          json.dump({"cumulative_drift": global_l3_drift_list}, f, indent=2)
 
     # ---- evaluation ----
     eval_clients = list(nets.keys())
